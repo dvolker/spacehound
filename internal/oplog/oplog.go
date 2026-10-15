@@ -6,6 +6,7 @@ package oplog
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -57,11 +58,14 @@ type Logger struct {
 	// readRecord observes deserialization for regression tests. It is called
 	// under mu, and is never needed by production callers.
 	readRecord func()
+	// beforeAppend permits a deterministic outside-writer regression test.
+	beforeAppend func()
 }
 
 type journalCache struct {
 	valid   bool
 	id      fsid.Identity
+	digest  [sha256.Size]byte
 	pending map[string]Entry
 }
 
@@ -106,6 +110,9 @@ func (l *Logger) Log(e Entry) (err error) {
 		return err
 	}
 	before := l.cache.id
+	if l.beforeAppend != nil {
+		l.beforeAppend()
+	}
 	b = append(b, '\n')
 	if n, err := f.Write(b); err != nil {
 		return err
@@ -122,9 +129,20 @@ func (l *Logger) Log(e Entry) (err error) {
 	if !after.SameFile(before) || after.Size != before.Size+int64(len(b)) {
 		return errors.New("journal changed during append")
 	}
-	// The advisory lock serializes other Logger instances. Also check the
-	// appended bytes and pathname before trusting our own state update; an
-	// unexpected writer or replacement must not become a cached validation.
+	// An overlapping outside write can share the timestamps produced by our
+	// append. Rehash the old prefix before assigning those timestamps to cached
+	// state; the advisory lock alone cannot exclude noncooperating writers.
+	h := sha256.New()
+	n, err := io.Copy(h, io.NewSectionReader(f, 0, before.Size))
+	if err != nil {
+		return err
+	}
+	if n != before.Size {
+		return io.ErrUnexpectedEOF
+	}
+	if !bytes.Equal(h.Sum(nil), l.cache.digest[:]) {
+		return errors.New("journal history changed during append")
+	}
 	tail := make([]byte, len(b))
 	if _, err := f.ReadAt(tail, before.Size); err != nil {
 		return err
@@ -135,8 +153,10 @@ func (l *Logger) Log(e Entry) (err error) {
 	if err := validateCurrent(dir, f, after); err != nil {
 		return err
 	}
+	h.Write(b)
 	applyEntry(l.cache.pending, e)
 	l.cache.id = after
+	copy(l.cache.digest[:], h.Sum(nil))
 	return nil
 }
 
@@ -215,7 +235,8 @@ func (l *Logger) replay(f *os.File) error {
 		}
 	}
 	byID := make(map[string]Entry)
-	scanner := bufio.NewScanner(io.NewSectionReader(f, 0, id.Size))
+	h := sha256.New()
+	scanner := bufio.NewScanner(io.TeeReader(io.NewSectionReader(f, 0, id.Size), h))
 	scanner.Buffer(make([]byte, 4096), maxRecordBytes)
 	scanner.Split(journalLines)
 	line := 0
@@ -247,6 +268,7 @@ func (l *Logger) replay(f *os.File) error {
 		return errors.New("journal changed during validation")
 	}
 	l.cache = journalCache{valid: true, id: id, pending: byID}
+	copy(l.cache.digest[:], h.Sum(nil))
 	return nil
 }
 

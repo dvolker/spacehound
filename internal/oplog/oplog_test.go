@@ -431,6 +431,55 @@ func TestJournalExternalAppendReplaysWholeHistory(t *testing.T) {
 	assertJournalRefused(t, l)
 }
 
+func TestJournalRejectsPrefixRewriteOverlappingOwnAppend(t *testing.T) {
+	for _, rewrite := range []string{"malformed", "valid JSON"} {
+		t.Run(rewrite, func(t *testing.T) {
+			l := New(fixtureDir(t))
+			if err := l.Log(Entry{ID: "a", Phase: "intent", Path: "/a", RecoveryPath: "/r/a"}); err != nil {
+				t.Fatal(err)
+			}
+			before := l.cache
+			l.beforeAppend = func() {
+				b, err := os.ReadFile(l.Path())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if rewrite == "malformed" {
+					b[0] = '!'
+				} else {
+					b = bytes.ReplaceAll(b, []byte("/a"), []byte("/b"))
+				}
+				f, err := os.OpenFile(l.Path(), os.O_WRONLY, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := f.WriteAt(b, 0); err != nil {
+					t.Fatal(err)
+				}
+				if err := f.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Our append masks the prefix writer's mtime/ctime transition.
+			// Its resulting stamp must never certify the old pending state.
+			err := l.Log(Entry{ID: "a", Phase: "complete", Path: "/a", Error: strings.Repeat("x", 800*1024)})
+			if err == nil || !strings.Contains(err.Error(), "history changed during append") {
+				t.Fatalf("overlapping prefix rewrite accepted: %v", err)
+			}
+			if l.cache.id != before.id || l.cache.digest != before.digest || l.cache.pending["a"].Phase != "intent" {
+				t.Fatal("failed append verification changed cached recovery state")
+			}
+			l.beforeAppend = nil
+			if rewrite == "malformed" {
+				assertJournalRefused(t, l)
+				if _, err := New(l.Dir).Pending(); err == nil {
+					t.Fatal("fresh recovery accepted malformed history")
+				}
+			}
+		})
+	}
+}
+
 func TestJournalRejectsChangesDuringReplay(t *testing.T) {
 	l := New(fixtureDir(t))
 	if err := os.WriteFile(l.Path(), journalRecord(t, Entry{ID: "a", Phase: "intent", Path: "/a", RecoveryPath: "/r/a"}), 0o600); err != nil {
@@ -601,6 +650,44 @@ func TestConcurrentLoggersPreserveAllRecoveryPhases(t *testing.T) {
 	pending, err := fresh.Pending()
 	if err != nil || len(pending) != 0 || parsed != workers*operations*3 {
 		t.Fatalf("concurrent journal: %d pending, %d records, %v", len(pending), parsed, err)
+	}
+}
+
+func BenchmarkJournalHistory(b *testing.B) {
+	record := []byte("{\"operation_id\":\"finished\",\"phase\":\"complete\",\"path\":\"/fixture\"}\n")
+	history := bytes.Repeat(record, 50000)
+	for _, operation := range []string{"full replay", "cached check", "verified append"} {
+		b.Run(operation, func(b *testing.B) {
+			dir, err := filepath.EvalSymlinks(b.TempDir())
+			if err != nil {
+				b.Fatal(err)
+			}
+			l := New(dir)
+			if err := os.WriteFile(l.Path(), history, 0o600); err != nil {
+				b.Fatal(err)
+			}
+			if err := l.Check(); err != nil {
+				b.Fatal(err)
+			}
+			if operation != "cached check" {
+				b.SetBytes(int64(len(history)))
+			}
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				var err error
+				switch operation {
+				case "full replay":
+					_, err = New(dir).Pending()
+				case "cached check":
+					err = l.Check()
+				case "verified append":
+					err = l.Log(Entry{ID: "new", Phase: "complete", Path: "/fixture"})
+				}
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
 

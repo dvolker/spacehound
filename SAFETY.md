@@ -119,7 +119,10 @@ enforced as `0700`/`0600`, and extended ACL grants are removed. The journal
 records paths, sizes, hashes, phases and outcomes, never file contents.
 Within a running process, an unchanged journal reuses its validated recovery
 state. External changes trigger a full replay; detected truncation blocks
-further writes.
+further writes. Each append verifies the prior bytes against their validated
+checksum before updating cached state. This still reads historical bytes,
+while avoiding repeated JSON decoding and detecting overlapping writes that
+ignore the journal locks.
 
 An unavailable or unreadable journal blocks file-changing operations. Intent
 records are flushed before a source is captured. Failure or cancellation
