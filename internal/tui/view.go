@@ -75,7 +75,6 @@ func pad(s string, w int) string {
 // wrap breaks text into lines of at most w runes at spaces.
 func wrap(s string, w int) []string {
 	s = display.Text(s)
-	s = display.Text(s)
 	if w < 10 {
 		w = 10
 	}

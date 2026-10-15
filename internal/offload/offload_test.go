@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -150,17 +151,53 @@ func TestOffloadSuccessKeepsSource(t *testing.T) {
 	}
 }
 func TestOffloadRefusesExistingDest(t *testing.T) {
-	e := setup(t, data(10))
-	dest, _ := e.o.Plan(e.req)
-	os.MkdirAll(filepath.Dir(dest), 0755)
-	os.WriteFile(dest, []byte("precious"), 0644)
-	if _, err := e.o.Offload(context.Background(), e.req, nil); !errors.Is(err, ErrDestExists) {
-		t.Fatal(err)
+	for _, kind := range []string{"file", "directory", "dangling-symlink", "fifo"} {
+		t.Run(kind, func(t *testing.T) {
+			e := setup(t, data(10))
+			dest, err := e.o.Plan(e.req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			switch kind {
+			case "file":
+				err = os.WriteFile(dest, []byte("precious"), 0o644)
+			case "directory":
+				err = os.Mkdir(dest, 0o755)
+			case "dangling-symlink":
+				err = os.Symlink("missing-target", dest)
+			case "fifo":
+				err = syscall.Mkfifo(dest, 0o600)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			e.o.Copy = func(context.Context, *os.File, *os.File, func(int64)) error {
+				t.Fatal("copied source for an occupied destination")
+				return nil
+			}
+			res, err := e.o.Offload(context.Background(), e.req, nil)
+			if !errors.Is(err, ErrDestExists) || res.Partial != "" || res.Verified {
+				t.Fatal(res, err)
+			}
+			entries, err := os.ReadDir(filepath.Dir(dest))
+			if err != nil || len(entries) != 1 || entries[0].Name() != filepath.Base(dest) {
+				t.Fatalf("unexpected copy artifacts: %v, %v", entries, err)
+			}
+			journal, err := os.ReadFile(e.o.Journal.Path())
+			if err != nil || len(journal) != 0 {
+				t.Fatalf("journaled an occupied destination: %s, %v", journal, err)
+			}
+			if kind == "file" {
+				if b, err := os.ReadFile(dest); err != nil || string(b) != "precious" {
+					t.Fatalf("destination changed: %q, %v", b, err)
+				}
+			}
+			retained(t, e, data(10))
+		})
 	}
-	if b, _ := os.ReadFile(dest); string(b) != "precious" {
-		t.Fatal("overwritten")
-	}
-	retained(t, e, data(10))
 }
 func TestOffloadRefusesDestAppearingDuringCopy(t *testing.T) {
 	e := setup(t, data(10))

@@ -37,6 +37,16 @@ static int sh_openat(int dir, const char *name, int flags, mode_t mode, int *fd)
 static int sh_mkdirat(int dir, const char *name, mode_t mode) {
     return mkdirat(dir, name, mode) < 0 ? errno : 0;
 }
+static int sh_existsat(int dir, const char *name, int *exists) {
+    struct stat st;
+    if (fstatat(dir, name, &st, AT_SYMLINK_NOFOLLOW) == 0) {
+        *exists = 1;
+        return 0;
+    }
+    if (errno != ENOENT) return errno;
+    *exists = 0;
+    return 0;
+}
 static int sh_rename(int fromdir, const char *from, int todir, const char *to) {
     return renameatx_np(fromdir, from, todir, to, RENAME_EXCL) < 0 ? errno : 0;
 }
@@ -115,8 +125,10 @@ static int sh_acl_empty(int fd, int *empty) {
     if (acl == NULL) return errno;
     acl_entry_t entry;
     int result = acl_get_entry(acl, ACL_FIRST_ENTRY, &entry);
-    int saved = result < 0 ? errno : 0;
-    *empty = result == 0;
+    // Darwin returns zero for an entry, and -1/EINVAL at the end of a valid
+    // ACL (unlike implementations that return 1/0 for entry/end).
+    *empty = result < 0 && errno == EINVAL;
+    int saved = result < 0 && !*empty ? errno : 0;
     acl_free(acl);
     return saved;
 }
@@ -225,6 +237,22 @@ func OpenAt(dir *os.File, name string, flags int, mode os.FileMode) (*os.File, e
 	return os.NewFile(uintptr(fd), filepath.Join(dir.Name(), name)), nil
 }
 
+// ExistsAt checks one entry without following symlinks or opening its contents.
+// Callers still need an exclusive operation to reject later replacements.
+func ExistsAt(dir *os.File, name string) (bool, error) {
+	defer runtime.KeepAlive(dir)
+	if err := component(name); err != nil {
+		return false, err
+	}
+	n := C.CString(name)
+	defer C.free(unsafe.Pointer(n))
+	var exists C.int
+	if err := errnoError("fstatat", name, C.sh_existsat(C.int(dir.Fd()), n, &exists)); err != nil {
+		return false, err
+	}
+	return exists != 0, nil
+}
+
 // MkdirAt creates one directory entry and never follows an existing entry.
 func MkdirAt(dir *os.File, name string, mode os.FileMode) error {
 	defer runtime.KeepAlive(dir)
@@ -305,21 +333,30 @@ func MakePrivate(f *os.File, mode os.FileMode) error {
 			(kind == syscall.S_IFREG && mode == 0o600 && before.Nlink == 1)) {
 		return fmt.Errorf("unsafe ownership, type, link count or private mode for %s", f.Name())
 	}
-	if err := errnoError("make private", f.Name(), C.sh_private(C.int(f.Fd()), C.mode_t(mode))); err != nil {
+	var empty C.int
+	if err := errnoError("check private ACL", f.Name(), C.sh_acl_empty(C.int(f.Fd()), &empty)); err != nil {
+		return err
+	}
+	changed := before.Mode&0o7777 != uint16(mode) || empty == 0
+	if changed {
+		if err := errnoError("make private", f.Name(), C.sh_private(C.int(f.Fd()), C.mode_t(mode))); err != nil {
+			return err
+		}
+	}
+	if err := errnoError("verify private ACL", f.Name(), C.sh_acl_empty(C.int(f.Fd()), &empty)); err != nil {
 		return err
 	}
 	after, err := stat(f)
 	if err != nil {
 		return err
 	}
-	var empty C.int
-	if err := errnoError("verify private ACL", f.Name(), C.sh_acl_empty(C.int(f.Fd()), &empty)); err != nil {
-		return err
-	}
 	if after.Dev != before.Dev || after.Ino != before.Ino || after.Uid != before.Uid ||
 		after.Mode&0o7777 != uint16(mode) || after.Mode&syscall.S_IFMT != kind ||
 		(kind == syscall.S_IFREG && after.Nlink != 1) || empty == 0 {
 		return fmt.Errorf("could not verify private permissions for %s", f.Name())
+	}
+	if !changed && kind == syscall.S_IFREG && !stable(before, after) {
+		return fmt.Errorf("%w: private file %s", ErrChanged, f.Name())
 	}
 	return nil
 }

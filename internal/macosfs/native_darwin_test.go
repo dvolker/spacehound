@@ -257,6 +257,46 @@ func TestMakePrivateClearsACLAndRefusesHardLinks(t *testing.T) {
 	}
 }
 
+func TestMakePrivateDoesNotChangeAlreadyPrivateMetadata(t *testing.T) {
+	_, dir := fixture(t)
+	f := file(t, dir, "private", []byte("private contents"))
+	for _, item := range []struct {
+		file *os.File
+		mode os.FileMode
+	}{{f, 0o600}, {dir, 0o700}} {
+		if err := MakePrivate(item.file, item.mode); err != nil {
+			t.Fatal(err)
+		}
+		before, err := stat(item.file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 3; i++ {
+			if err := MakePrivate(item.file, item.mode); err != nil {
+				t.Fatal(err)
+			}
+		}
+		after, err := stat(item.file)
+		if err != nil || !stable(before, after) {
+			t.Fatalf("private metadata changed: before %+v; after %+v; %v", before, after, err)
+		}
+	}
+}
+
+func TestMakePrivateClearsACLWhenModeAlreadyPrivate(t *testing.T) {
+	path, dir := fixture(t)
+	f := file(t, dir, "private", []byte("private contents"))
+	name := filepath.Join(path, "private")
+	command(t, "/bin/chmod", "+a", "everyone allow read,readattr,readextattr,readsecurity", name)
+	if err := MakePrivate(f, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output, err := exec.Command("/bin/ls", "-le", name).CombinedOutput()
+	if err != nil || bytes.Contains(output, []byte("everyone")) {
+		t.Fatalf("extended ACL survived private mode: %s, %v", output, err)
+	}
+}
+
 func TestResourceForkChangeChangesFingerprint(t *testing.T) {
 	path, dir := fixture(t)
 	f := file(t, dir, "source", []byte("same primary contents"))

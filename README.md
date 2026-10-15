@@ -191,7 +191,7 @@ physical savings.
 
 ## Demo and verification
 
-`--demo` builds a deterministic fixture tree in the OS temp directory: a fake
+`--demo` builds a deterministic fixture tree under `/private/tmp`: a fake
 home, a fake `/Volumes` with one usable drive and two unsuitable ones, a
 private Trash folder and a private log directory. All scanning, trashing and
 offloading in demo mode stays inside that tree, and the tree is deleted on

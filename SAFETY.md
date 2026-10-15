@@ -71,7 +71,8 @@ not promised.
 2. The destination is
    `<volume>/SpaceHound Archive/<hostname>/<YYYY-MM-DD>/<relative path>`.
    Traversal components and symlink ancestors are rejected. Created archive
-   ancestors are synchronized before descending into them.
+   ancestors are synchronized before descending into them. An occupied
+   destination is refused before hashing or copying the source.
 3. Data is copied through held descriptors to a new partial file. Native
    metadata copying preserves resource forks, extended attributes, ACLs,
    permissions, ownership, modification/creation times and preservable
@@ -116,6 +117,9 @@ file-changing operations, its directory/file are required to be caller-owned,
 without symlinks, with one hard link for the file. Their permissions are
 enforced as `0700`/`0600`, and extended ACL grants are removed. The journal
 records paths, sizes, hashes, phases and outcomes, never file contents.
+Within a running process, an unchanged journal reuses its validated recovery
+state. External changes trigger a full replay; detected truncation blocks
+further writes.
 
 An unavailable or unreadable journal blocks file-changing operations. Intent
 records are flushed before a source is captured. Failure or cancellation
@@ -135,8 +139,8 @@ SpaceHound never deletes APFS/Time Machine snapshots or runs privileged
 commands. Savings estimates account for allocated bytes and hard links;
 clones, snapshots and open files can reduce actual reclaimed space.
 
-`--demo` creates a temporary fixture with its own home, volumes, Trash and
-journal. All actions stay within that fixture, which is removed on exit.
+`--demo` creates a fixture under `/private/tmp` with its own home, volumes,
+Trash and journal. All actions stay within that fixture, which is removed on exit.
 Tests use generated fixtures and cover refused operations as well as success.
 
 ## Native API references
@@ -146,7 +150,7 @@ metadata: [extendedAttributes](apple-docs://fileprovider/nsfileprovideritemproto
 SpaceHound includes its bytes in complete verification.
 
 The native layer follows the SDK headers and local macOS manuals for
-`openat(2)`, `renameatx_np(2)`, `unlinkat(2)`, `fcopyfile(3)`,
+`openat(2)`, `fstatat(2)`, `renameatx_np(2)`, `unlinkat(2)`, `fcopyfile(3)`,
 `fsetattrlist(2)`, `getxattr(2)`, `acl_copy_ext(3)` and `fcntl(2)`.
 These libc entry points were not found in the Cupertino documentation index;
 runtime capability probes are required in addition to compilation.

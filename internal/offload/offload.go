@@ -184,16 +184,6 @@ func (o *Offloader) Offload(ctx context.Context, req Request, progress ProgressF
 		return res, err
 	}
 	res.Dest = dest
-	// Capture a stable, complete source fingerprint before making any copy.
-	before, err := macosfs.FingerprintFile(ctx, source, nil)
-	if err != nil {
-		return res, err
-	}
-	if fi, err := source.Stat(); err != nil {
-		return res, err
-	} else if err := fsid.Check(fi, req.Identity); err != nil {
-		return res, err
-	}
 	dirPath := filepath.Dir(dest)
 	dir, err := macosfs.OpenDir(dirPath, true, 0o755)
 	if err != nil {
@@ -202,6 +192,21 @@ func (o *Offloader) Offload(ctx context.Context, req Request, progress ProgressF
 	defer dir.Close()
 	// Opening from / is no-follow; also reject a changed volume root.
 	if err := fileops.CheckDir(root, vol.Path); err != nil {
+		return res, err
+	}
+	if exists, err := macosfs.ExistsAt(dir, filepath.Base(dest)); err != nil {
+		return res, err
+	} else if exists {
+		return res, ErrDestExists
+	}
+	// Capture a stable, complete source fingerprint before making any copy.
+	before, err := macosfs.FingerprintFile(ctx, source, nil)
+	if err != nil {
+		return res, err
+	}
+	if fi, err := source.Stat(); err != nil {
+		return res, err
+	} else if err := fsid.Check(fi, req.Identity); err != nil {
 		return res, err
 	}
 	partial := ".spacehound-partial-" + fileops.ID()

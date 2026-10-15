@@ -106,7 +106,7 @@ func TestRunErrorsCannotInjectTerminalControls(t *testing.T) {
 }
 
 func TestDemoMutationWiringStaysInFixture(t *testing.T) {
-	t.Setenv("TMPDIR", "/private/tmp")
+	t.Setenv("TMPDIR", "/private/var/folders/spacehound-demo-must-not-create")
 	fixture, err := demo.Build()
 	if err != nil {
 		t.Fatal(err)

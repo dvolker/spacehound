@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"spacehound/internal/fsid"
 	"spacehound/internal/macosfs"
 )
 
@@ -51,6 +52,17 @@ type Logger struct {
 	Dir string
 	Now func() time.Time
 	mu  sync.Mutex
+
+	cache journalCache
+	// readRecord observes deserialization for regression tests. It is called
+	// under mu, and is never needed by production callers.
+	readRecord func()
+}
+
+type journalCache struct {
+	valid   bool
+	id      fsid.Identity
+	pending map[string]Entry
 }
 
 // New returns a logger writing into dir. The directory is created lazily
@@ -89,17 +101,43 @@ func (l *Logger) Log(e Entry) (err error) {
 	if err != nil {
 		return err
 	}
-	defer func() { err = errors.Join(err, closeFiles(f, dir)) }()
-	if _, err := readPending(f); err != nil {
+	defer func() { err = errors.Join(err, closeJournal(f, dir)) }()
+	if err := l.replay(f); err != nil {
 		return err
 	}
+	before := l.cache.id
 	b = append(b, '\n')
 	if n, err := f.Write(b); err != nil {
 		return err
 	} else if n != len(b) {
 		return io.ErrShortWrite
 	}
-	return syncFiles(f, dir)
+	if err := syncFiles(f, dir); err != nil {
+		return err
+	}
+	after, _, err := fsid.FromOpen(f)
+	if err != nil {
+		return err
+	}
+	if !after.SameFile(before) || after.Size != before.Size+int64(len(b)) {
+		return errors.New("journal changed during append")
+	}
+	// The advisory lock serializes other Logger instances. Also check the
+	// appended bytes and pathname before trusting our own state update; an
+	// unexpected writer or replacement must not become a cached validation.
+	tail := make([]byte, len(b))
+	if _, err := f.ReadAt(tail, before.Size); err != nil {
+		return err
+	}
+	if !bytes.Equal(tail, b) {
+		return errors.New("journal appended record changed")
+	}
+	if err := validateCurrent(dir, f, after); err != nil {
+		return err
+	}
+	applyEntry(l.cache.pending, e)
+	l.cache.id = after
+	return nil
 }
 
 // Check prepares the journal and validates it before a destructive operation.
@@ -115,11 +153,14 @@ func (l *Logger) Check() (err error) {
 	if err != nil {
 		return err
 	}
-	defer func() { err = errors.Join(err, closeFiles(f, dir)) }()
-	if _, err := readPending(f); err != nil {
+	defer func() { err = errors.Join(err, closeJournal(f, dir)) }()
+	if err := l.replay(f); err != nil {
 		return err
 	}
-	return syncFiles(f, dir)
+	if err := syncFiles(f, dir); err != nil {
+		return err
+	}
+	return validateCurrent(dir, f, l.cache.id)
 }
 
 // Pending returns each operation whose latest phase is not complete. It does
@@ -135,50 +176,109 @@ func (l *Logger) Pending() (pending []Entry, err error) {
 	dir, f, err := l.open(false)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
+			if l.cache.valid {
+				return nil, errors.New("previously validated journal disappeared")
+			}
 			return nil, nil
 		}
 		return nil, err
 	}
-	defer func() { err = errors.Join(err, closeFiles(f, dir)) }()
-	return readPending(f)
+	defer func() { err = errors.Join(err, closeJournal(f, dir)) }()
+	if err := l.replay(f); err != nil {
+		return nil, err
+	}
+	if err := validateCurrent(dir, f, l.cache.id); err != nil {
+		return nil, err
+	}
+	for _, e := range l.cache.pending {
+		pending = append(pending, e)
+	}
+	sort.Slice(pending, func(i, j int) bool { return pending[i].ID < pending[j].ID })
+	return pending, nil
 }
 
-func readPending(f *os.File) ([]Entry, error) {
+// replay reuses only an exactly matching, previously validated file. A larger
+// size alone is not evidence of an append: outside changes must replay the
+// entire journal, including any rewritten prefix. Our own durable appends can
+// update the pending map directly while holding the exclusive file lock.
+func (l *Logger) replay(f *os.File) error {
+	id, _, err := fsid.FromOpen(f)
+	if err != nil {
+		return err
+	}
+	if l.cache.valid {
+		if id == l.cache.id {
+			return nil
+		}
+		if id.SameFile(l.cache.id) && id.Size < l.cache.id.Size {
+			return errors.New("previously validated journal was truncated")
+		}
+	}
 	byID := make(map[string]Entry)
-	scanner := bufio.NewScanner(f)
+	scanner := bufio.NewScanner(io.NewSectionReader(f, 0, id.Size))
 	scanner.Buffer(make([]byte, 4096), maxRecordBytes)
 	scanner.Split(journalLines)
 	line := 0
 	for scanner.Scan() {
 		line++
+		if l.readRecord != nil {
+			l.readRecord()
+		}
 		var e *Entry
 		if err := json.Unmarshal(scanner.Bytes(), &e); err != nil {
-			return nil, fmt.Errorf("record %d: %w", line, err)
+			return fmt.Errorf("record %d: %w", line, err)
 		}
 		if e == nil {
-			return nil, fmt.Errorf("record %d: expected an operation object", line)
+			return fmt.Errorf("record %d: expected an operation object", line)
 		}
 		if err := validateEntry(*e); err != nil {
-			return nil, fmt.Errorf("record %d: %w", line, err)
+			return fmt.Errorf("record %d: %w", line, err)
 		}
-		if e.Phase == "" {
-			continue // Entries from versions without recovery journaling.
-		}
-		if e.Phase == "complete" {
-			delete(byID, e.ID)
-		} else {
-			byID[e.ID] = *e
-		}
+		applyEntry(byID, *e)
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("record %d: %w", line+1, err)
+		return fmt.Errorf("record %d: %w", line+1, err)
 	}
-	var pending []Entry
-	for _, e := range byID {
-		pending = append(pending, e)
+	after, _, err := fsid.FromOpen(f)
+	if err != nil {
+		return err
 	}
-	sort.Slice(pending, func(i, j int) bool { return pending[i].ID < pending[j].ID })
-	return pending, nil
+	if after != id {
+		return errors.New("journal changed during validation")
+	}
+	l.cache = journalCache{valid: true, id: id, pending: byID}
+	return nil
+}
+
+func applyEntry(byID map[string]Entry, e Entry) {
+	if e.Phase == "complete" {
+		delete(byID, e.ID)
+	} else if e.Phase != "" {
+		byID[e.ID] = e
+	}
+}
+
+func validateCurrent(dir, f *os.File, want fsid.Identity) (err error) {
+	if err := validateFile(f, true); err != nil {
+		return err
+	}
+	current, err := macosfs.OpenAt(dir, FileName, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return fmt.Errorf("reopen journal during validation: %w", err)
+	}
+	defer func() { err = errors.Join(err, current.Close()) }()
+	id, _, err := fsid.FromOpen(current)
+	if err != nil {
+		return err
+	}
+	after, _, err := fsid.FromOpen(f)
+	if err != nil {
+		return err
+	}
+	if id != want || after != want {
+		return errors.New("journal changed during operation")
+	}
+	return nil
 }
 
 func (l *Logger) open(writable bool) (*os.File, *os.File, error) {
@@ -189,12 +289,22 @@ func (l *Logger) open(writable bool) (*os.File, *os.File, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	dir, err := macosfs.OpenDir(path, writable, 0o700)
+	dir, err := macosfs.OpenDir(path, writable && !l.cache.valid, 0o700)
 	if err != nil {
 		return nil, nil, err
 	}
-	fail := func(err error) (*os.File, *os.File, error) {
+	lock := syscall.LOCK_SH
+	if writable {
+		lock = syscall.LOCK_EX
+	}
+	// Lock the stable directory before opening the file as well: this
+	// serializes first creation and pathname changes between logger instances.
+	// Always acquire directory then file locks, and release in reverse order.
+	if err := syscall.Flock(int(dir.Fd()), lock); err != nil {
 		return nil, nil, errors.Join(err, dir.Close())
+	}
+	fail := func(err error) (*os.File, *os.File, error) {
+		return nil, nil, errors.Join(err, closeDirectory(dir))
 	}
 	if err := validateFile(dir, false); err != nil {
 		return fail(err)
@@ -206,18 +316,24 @@ func (l *Logger) open(writable bool) (*os.File, *os.File, error) {
 	}
 	flags := os.O_RDONLY | syscall.O_NONBLOCK
 	if writable {
-		flags = os.O_RDWR | os.O_APPEND | os.O_CREATE | syscall.O_NONBLOCK
+		flags = os.O_RDWR | os.O_APPEND | syscall.O_NONBLOCK
+		if !l.cache.valid {
+			flags |= os.O_CREATE
+		}
 	}
 	f, err := macosfs.OpenAt(dir, FileName, flags, 0o600)
 	if err != nil {
-		return fail(err)
+		return fail(fmt.Errorf("open journal: %w", err))
+	}
+	if err := syscall.Flock(int(f.Fd()), lock); err != nil {
+		return nil, nil, errors.Join(err, f.Close(), closeDirectory(dir))
 	}
 	if err := validateFile(f, true); err != nil {
-		return nil, nil, errors.Join(err, closeFiles(f, dir))
+		return nil, nil, errors.Join(err, closeJournal(f, dir))
 	}
 	if writable {
 		if err := macosfs.MakePrivate(f, 0o600); err != nil {
-			return nil, nil, errors.Join(err, closeFiles(f, dir))
+			return nil, nil, errors.Join(err, closeJournal(f, dir))
 		}
 	}
 	return dir, f, nil
@@ -286,12 +402,12 @@ func syncFiles(files ...*os.File) error {
 	return nil
 }
 
-func closeFiles(files ...*os.File) error {
-	var err error
-	for _, f := range files {
-		err = errors.Join(err, f.Close())
-	}
-	return err
+func closeDirectory(dir *os.File) error {
+	return errors.Join(syscall.Flock(int(dir.Fd()), syscall.LOCK_UN), dir.Close())
+}
+
+func closeJournal(f, dir *os.File) error {
+	return errors.Join(syscall.Flock(int(f.Fd()), syscall.LOCK_UN), f.Close(), closeDirectory(dir))
 }
 
 func wrapError(err *error) {

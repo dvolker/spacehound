@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -352,6 +354,295 @@ func TestLogRejectsOversizedEntryBeforeWriting(t *testing.T) {
 	if _, err := os.Stat(l.Dir); !os.IsNotExist(err) {
 		t.Fatalf("invalid entry created journal directory: %v", err)
 	}
+}
+
+func TestJournalReusesValidatedHistoryAndAppliesOwnAppends(t *testing.T) {
+	l := New(fixtureDir(t))
+	var history bytes.Buffer
+	const records = 1000
+	for i := 0; i < records; i++ {
+		history.Write(journalRecord(t, Entry{ID: fmt.Sprint(i), Phase: "intent", Path: "/fixture", RecoveryPath: "/recovery"}))
+	}
+	if err := os.WriteFile(l.Path(), history.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	parsed := 0
+	l.readRecord = func() { parsed++ }
+	if err := l.Check(); err != nil {
+		t.Fatal(err)
+	}
+	if parsed != records {
+		t.Fatalf("initial validation deserialized %d records, want %d", parsed, records)
+	}
+	for i := 0; i < 10; i++ {
+		if err := l.Check(); err != nil {
+			t.Fatal(err)
+		}
+		if err := l.Log(Entry{ID: fmt.Sprint(i), Phase: "complete", Path: "/fixture"}); err != nil {
+			t.Fatal(err)
+		}
+		pending, err := l.Pending()
+		if err != nil || len(pending) != records-i-1 {
+			t.Fatalf("pending after append %d: %d entries, %v", i, len(pending), err)
+		}
+	}
+	if parsed != records {
+		t.Fatalf("unchanged history was deserialized again: got %d, want %d", parsed, records)
+	}
+	// A new process/logger must recover from the durable journal, independently
+	// of the map maintained by the writer.
+	fresh := New(l.Dir)
+	freshParsed := 0
+	fresh.readRecord = func() { freshParsed++ }
+	pending, err := fresh.Pending()
+	if err != nil || len(pending) != records-10 || freshParsed != records+10 {
+		t.Fatalf("fresh replay: %d pending, %d parsed, %v", len(pending), freshParsed, err)
+	}
+}
+
+func TestJournalExternalAppendReplaysWholeHistory(t *testing.T) {
+	l := New(fixtureDir(t))
+	if err := l.Log(Entry{ID: "a", Phase: "intent", Path: "/a", RecoveryPath: "/r/a"}); err != nil {
+		t.Fatal(err)
+	}
+	parsed := 0
+	l.readRecord = func() { parsed++ }
+	appendJournal(t, l.Path(), journalRecord(t, Entry{ID: "b", Phase: "intent", Path: "/b", RecoveryPath: "/r/b"}))
+	pending, err := l.Pending()
+	if err != nil || len(pending) != 2 || pending[1].ID != "b" || parsed != 2 {
+		t.Fatalf("external append: %+v, %d parsed, %v", pending, parsed, err)
+	}
+	if err := l.Check(); err != nil || parsed != 2 {
+		t.Fatalf("repeated validation: %d parsed, %v", parsed, err)
+	}
+	// Growth cannot be trusted as proof of append-only changes. A rewritten
+	// historical prefix plus a valid appended record must also be rejected.
+	f, err := os.OpenFile(l.Path(), os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte("!"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	appendJournal(t, l.Path(), journalRecord(t, Entry{Action: "trash", Path: "/legacy"}))
+	assertJournalRefused(t, l)
+}
+
+func TestJournalRejectsChangesDuringReplay(t *testing.T) {
+	l := New(fixtureDir(t))
+	if err := os.WriteFile(l.Path(), journalRecord(t, Entry{ID: "a", Phase: "intent", Path: "/a", RecoveryPath: "/r/a"}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	changed := false
+	l.readRecord = func() {
+		if !changed {
+			changed = true
+			// An outside writer that ignores the advisory lock must still be
+			// detected when it changes the file during a bounded replay.
+			appendJournal(t, l.Path(), journalRecord(t, Entry{ID: "b", Phase: "intent", Path: "/b", RecoveryPath: "/r/b"}))
+		}
+	}
+	if _, err := l.Pending(); err == nil {
+		t.Fatal("cached a journal that changed during replay")
+	}
+	if l.cache.valid {
+		t.Fatal("failed replay installed trusted state")
+	}
+	l.readRecord = nil
+	pending, err := l.Pending()
+	if err != nil || len(pending) != 2 {
+		t.Fatalf("fresh validation after outside write: %+v, %v", pending, err)
+	}
+}
+
+func TestJournalInvalidatesSameLengthRewriteWithRestoredMtime(t *testing.T) {
+	l := New(fixtureDir(t))
+	original := journalRecord(t, Entry{ID: "a", Phase: "intent", Path: "/a", RecoveryPath: "/r/a"})
+	if err := os.WriteFile(l.Path(), original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Check(); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(l.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed := 0
+	l.readRecord = func() { parsed++ }
+	rewritten := bytes.ReplaceAll(original, []byte("/a"), []byte("/b"))
+	if err := os.WriteFile(l.Path(), rewritten, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(l.Path(), fi.ModTime(), fi.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := l.Pending()
+	if err != nil || len(pending) != 1 || pending[0].Path != "/b" || parsed != 1 {
+		t.Fatalf("same-length rewrite: %+v, %d parsed, %v", pending, parsed, err)
+	}
+	rewritten[0] = '!'
+	if err := os.WriteFile(l.Path(), rewritten, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(l.Path(), fi.ModTime(), fi.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	assertJournalRefused(t, l)
+}
+
+func TestJournalInvalidatesSameSizeReplacement(t *testing.T) {
+	l := New(fixtureDir(t))
+	original := journalRecord(t, Entry{ID: "a", Phase: "intent", Path: "/a", RecoveryPath: "/r/a"})
+	if err := os.WriteFile(l.Path(), original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Check(); err != nil {
+		t.Fatal(err)
+	}
+	parsed := 0
+	l.readRecord = func() { parsed++ }
+	replacement := filepath.Join(l.Dir, "replacement")
+	rewritten := journalRecord(t, Entry{ID: "b", Phase: "intent", Path: "/b", RecoveryPath: "/r/b"})
+	if len(rewritten) != len(original) {
+		t.Fatal("replacement fixture has a different length")
+	}
+	if err := os.WriteFile(replacement, rewritten, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, l.Path()); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := l.Pending()
+	if err != nil || len(pending) != 1 || pending[0].ID != "b" || parsed != 1 {
+		t.Fatalf("same-size replacement: %+v, %d parsed, %v", pending, parsed, err)
+	}
+	rewritten[0] = '!'
+	if err := os.WriteFile(replacement, rewritten, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, l.Path()); err != nil {
+		t.Fatal(err)
+	}
+	assertJournalRefused(t, l)
+}
+
+func TestJournalRejectsObservedTruncationAndDisappearance(t *testing.T) {
+	for _, mode := range []string{"record boundary", "incomplete record", "missing file", "missing directory"} {
+		t.Run(mode, func(t *testing.T) {
+			l := New(filepath.Join(fixtureDir(t), "SpaceHound"))
+			for _, id := range []string{"a", "b"} {
+				if err := l.Log(Entry{ID: id, Phase: "intent", Path: "/fixture", RecoveryPath: "/recovery"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			b, err := os.ReadFile(l.Path())
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch mode {
+			case "record boundary":
+				err = os.Truncate(l.Path(), int64(bytes.IndexByte(b, '\n')+1))
+			case "incomplete record":
+				err = os.Truncate(l.Path(), int64(len(b)-1))
+			case "missing file":
+				err = os.Remove(l.Path())
+			case "missing directory":
+				err = os.RemoveAll(l.Dir)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := l.Pending(); err == nil {
+				t.Error("Pending accepted lost journal history")
+			}
+			if err := l.Check(); err == nil {
+				t.Error("Check accepted lost journal history")
+			}
+			if err := l.Log(Entry{Action: "trash", Path: "/fixture"}); err == nil {
+				t.Error("Log accepted lost journal history")
+			}
+		})
+	}
+}
+
+func TestConcurrentLoggersPreserveAllRecoveryPhases(t *testing.T) {
+	dir := fixtureDir(t)
+	const workers, operations = 4, 20
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			l := New(dir)
+			for i := 0; i < operations; i++ {
+				id := fmt.Sprintf("%d-%d", worker, i)
+				for _, phase := range []string{"intent", "captured", "complete"} {
+					if err := l.Log(Entry{ID: id, Phase: phase, Path: "/fixture", RecoveryPath: "/recovery"}); err != nil {
+						errs <- err
+						return
+					}
+				}
+			}
+		}(worker)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	fresh := New(dir)
+	parsed := 0
+	fresh.readRecord = func() { parsed++ }
+	pending, err := fresh.Pending()
+	if err != nil || len(pending) != 0 || parsed != workers*operations*3 {
+		t.Fatalf("concurrent journal: %d pending, %d records, %v", len(pending), parsed, err)
+	}
+}
+
+func journalRecord(t *testing.T, e Entry) []byte {
+	t.Helper()
+	b, err := json.Marshal(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return append(b, '\n')
+}
+
+func appendJournal(t *testing.T, path string, b []byte) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(b); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertJournalRefused(t *testing.T, l *Logger) {
+	t.Helper()
+	b, err := os.ReadFile(l.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Pending(); err == nil {
+		t.Error("Pending trusted changed invalid journal")
+	}
+	if err := l.Check(); err == nil {
+		t.Error("Check trusted changed invalid journal")
+	}
+	if err := l.Log(Entry{Action: "trash", Path: "/fixture"}); err == nil {
+		t.Error("Log trusted changed invalid journal")
+	}
+	assertContents(t, l.Path(), b)
 }
 
 func fixtureDir(t *testing.T) string {
