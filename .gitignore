@@ -1,0 +1,5 @@
+/spacehound
+/dist/
+/.tmp/
+*.test
+*.out
