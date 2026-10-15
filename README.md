@@ -37,17 +37,23 @@ See [SAFETY.md](SAFETY.md) for the full safety model.
 
 ## Install
 
-### From a GitHub release (once published)
+### Quick install
 
 ```sh
-curl -fsSLO https://github.com/OWNER/spacehound/releases/download/v0.1.0/install.sh
+curl -fsSL https://github.com/myneid/spacehound/releases/latest/download/install.sh | sh -s -- --version latest
+```
+
+This installs to `~/.local/bin`. If you prefer to inspect the installer first:
+
+```sh
+curl -fsSLO https://github.com/myneid/spacehound/releases/latest/download/install.sh
 less install.sh                      # read it first
 sh install.sh --version v0.1.0       # installs to ~/.local/bin by default
 ```
 
-The `install.sh` attached to each release already knows its repository. If
-you use the copy from this source tree, add `--repo OWNER/spacehound`.
-`--version latest` only works against a published repository.
+The `install.sh` attached to each release and the copy in this source tree
+already know the repository. `--version latest` installs the newest published
+release.
 
 `install.sh` downloads the archive for your CPU and its `SHA256SUMS` file. It
 refuses to install unless the checksum matches. To install to

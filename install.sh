@@ -12,7 +12,7 @@
 # SPACEHOUND_REPO) names a real hosted repository.
 set -eu
 
-REPO="${SPACEHOUND_REPO:-OWNER/spacehound}"
+REPO="${SPACEHOUND_REPO:-myneid/spacehound}"
 VERSION="${SPACEHOUND_VERSION:-}"
 PREFIX="${SPACEHOUND_PREFIX:-$HOME/.local/bin}"
 NAME=spacehound
