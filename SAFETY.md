@@ -52,7 +52,10 @@ Before moving an original, SpaceHound records its intent and captures it in
 a private holding directory beside the source. It verifies the captured
 identity, moves it to the Trash, and checks the moved identity. Failure
 triggers a non-overwriting restoration attempt. If that is blocked, the
-file is preserved and its recovery location is reported.
+file is preserved and its recovery location is reported. If verification
+fails after a move into Trash, SpaceHound retains the descriptor-identified
+original at its current location instead of attempting rollback through a
+shared Trash pathname that another process could have replaced.
 
 Trash moves do not permanently unlink originals or immediately reclaim
 space. The operation log records both original and final paths. Restore

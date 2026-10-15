@@ -152,7 +152,7 @@ func TestTrashNeverRestoresAReplacement(t *testing.T) {
 	}
 }
 
-func TestTrashRestoresAfterDirectorySwap(t *testing.T) {
+func TestTrashReportsRecoveryAfterDirectorySwap(t *testing.T) {
 	src, dir, tr := setup(t)
 	id, _, _ := fsid.Of(src)
 	elsewhere := t.TempDir()
@@ -170,11 +170,15 @@ func TestTrashRestoresAfterDirectorySwap(t *testing.T) {
 		}
 		return nil
 	}
-	if _, err := tr.Trash(src, id); err == nil {
-		t.Fatal("accepted replaced Trash directory")
+	res, err := tr.Trash(src, id)
+	if err == nil || res.RecoveryPath != filepath.Join(dir+"-moved", "report.pdf") {
+		t.Fatal("missing actual original location", res, err)
 	}
-	if got, err := os.ReadFile(src); err != nil || string(got) != "original" {
-		t.Fatal("source not restored", string(got), err)
+	if got, err := os.ReadFile(res.RecoveryPath); err != nil || string(got) != "original" {
+		t.Fatal("original not preserved", string(got), err)
+	}
+	if _, err := os.Stat(src); !os.IsNotExist(err) {
+		t.Fatal("unexpected name-based rollback", err)
 	}
 	if entries, err := os.ReadDir(elsewhere); err != nil || len(entries) != 0 {
 		t.Fatal("wrote through symlink", entries, err)

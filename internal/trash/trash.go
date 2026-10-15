@@ -194,29 +194,17 @@ func (t *Trasher) Trash(path string, want fsid.Identity) (Result, error) {
 			err = capture.Dir.Sync()
 		}
 		if err != nil {
-			// Never move a replacement entry back to the source. The held
-			// descriptor still identifies the actual original wherever it moved.
-			existing, openErr := macosfs.OpenAt(dir, name, os.O_RDONLY|syscall.O_NONBLOCK, 0)
-			matches := false
-			if openErr == nil {
-				id, _, statErr := fsid.FromOpen(existing)
-				existing.Close()
-				matches = statErr == nil && id.SameFile(capturedID)
+			// A shared Trash pathname can be replaced even between an
+			// identity check and rollback. Preserve the descriptor-identified
+			// original instead of ever renaming that pathname back.
+			actual, pathErr := macosfs.Path(capture.File)
+			if pathErr != nil {
+				actual = res.Dest
 			}
-			if !matches {
-				actual, pathErr := macosfs.Path(capture.File)
-				if pathErr != nil {
-					actual = res.Dest
-				}
-				res.RecoveryPath = actual
-				return res, capture.Preserve(actual, errors.Join(err, openErr, pathErr))
-			}
-			if rollback := move(dir, name, capture.Dir, "original"); rollback != nil {
-				res.RecoveryPath = res.Dest
-				return res, capture.Preserve(res.Dest, errors.Join(err, rollback))
-			}
-			return res, capture.Restore(err)
+			res.RecoveryPath = actual
+			return res, capture.Preserve(actual, errors.Join(err, pathErr))
 		}
+
 		res.Method = "moved to " + res.Dest + "; restore manually from this location"
 		if err := capture.Done(); err != nil {
 			return res, fmt.Errorf("moved to %s; journal completion failed: %w", res.Dest, err)
